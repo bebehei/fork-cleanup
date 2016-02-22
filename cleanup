@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+
+import argparse
+import re
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta
+import github
+from github import Github
+from github.GithubException import GithubException, BadCredentialsException, UnknownObjectException, BadUserAgentException, RateLimitExceededException, BadAttributeException, TwoFactorException
+
+# enable this for heavy debugging
+#github.enable_console_debug_logging()
+
+parser = argparse.ArgumentParser(
+        description='Remove unused forks from your github account')
+
+parser.add_argument('--dry',
+        action='store_true',
+        help="Make a dry run. Only show forks to remove. But don't actually remove them. (Still queries the API!)",
+        )
+parser.add_argument('--no-forks',
+        action='store_false',
+        dest='forks',
+        help="Delete repo even it has got other childforks.",
+        )
+parser.set_defaults(forks=True)
+parser.add_argument('--no-issues',
+        action='store_false',
+        dest='issues',
+        help="Delete repo even it has got opened issues.",
+        )
+parser.set_defaults(issues=True)
+parser.add_argument('-y',
+        action='store_true',
+        dest='yes',
+        help="Answer all questions with yes.",
+        )
+parser.add_argument('-n',
+        action='store_false',
+        dest='yes',
+        help="Answer all questions with no.",
+        )
+parser.set_defaults(issues=True)
+parser.add_argument('--verbose', '-v',
+        action='count',
+        default=0,
+        help="Be verbose about actions and decisions. (multiple -v are allowed)",
+        )
+parser.add_argument('--time', '-t',
+        metavar="<DAYS>",
+        type=int,
+        default=0,
+        help="Idle time of the repo to delete.",
+        )
+parser.add_argument('--user', '-u',
+        metavar="<USERNAME>",
+        type=str,
+        help="User to search repos for (defaults to login or token user)",
+        )
+parser.add_argument('--credentials',
+        metavar="<FILE>",
+        type=str,
+        default="credentials.txt",
+        help="Alternate file to read credentials. (default 'credentials.txt')",
+        )
+
+args = parser.parse_args()
+
+auth_token = None
+auth_user = None
+auth_pass = None
+user = None
+
+try:
+    creds = open(args.credentials)
+    re_auth_token = re.compile('^AUTH_TOKEN=(.*)')
+    re_auth_user = re.compile('^AUTH_USER=(.*)')
+    re_auth_pass = re.compile('^AUTH_PASS=(.*)')
+    re_user = re.compile('^USER=(.*)')
+    for line in creds:
+        if re_auth_token.match(line):
+            re = re_auth_token.match(line)
+            auth_token = re.group(1)
+        if re_auth_user.match(line):
+            re = re_auth_user.match(line)
+            auth_user = re.group(1)
+        if re_auth_pass.match(line):
+            re = re_auth_pass.match(line)
+            auth_pass = re.group(1)
+        if re_user.match(line):
+            re = re_user.match(line)
+            user = re.group(1)
+except OSError as e:
+    if e.errno == e.ENOENT:
+        print("File '{0}' not found.".format(args.credentials))
+        sys.exit(1)
+    else:
+        raise
+
+if user is None or user is "":
+    user = auth_user
+if args.user:
+    user = args.user
+
+if args.verbose > 0:
+    print("AUTH_USER={0}".format(auth_user))
+    print("AUTH_PASS={0}".format(auth_pass))
+    print("AUTH_TOKEN={0}".format(auth_token))
+    print("USER={0}".format(user))
+
+try:
+    gh = None
+    if auth_token:
+        gh = Github(auth_token)
+    elif auth_user and auth_pass:
+        gh = Github(login_or_token=auth_user, password=auth_pass)
+    else:
+        print("No correct credentials provided.")
+        print("Please give either AUTH_TOKEN or (AUTH_USER and AUTH_PASS) in file '{0}'.".format(args.credentials))
+        sys.exit(1)
+
+    print("BEGIN: Retrieving information")
+
+    # ignore forks, which got updated in the given time
+    # this prevents removing forks, which are used in active development
+    # but would get marked as old by the comparison
+    date = datetime.now() - timedelta(days=args.time)
+    forks = [ repo for repo in gh.get_user(user).get_repos()
+            if repo.fork and repo.updated_at < date ]
+
+    # check that all branches are from fork are less up to date
+    branch_comparisons = defaultdict(dict)
+    for fork in forks:
+        print("Checking {0}".format(fork.full_name))
+        for branch_fork in fork.get_branches():
+
+            # get the branch from parent repo to compare against
+            # if no branch with the same name, use the default branch and assume it was a pull request
+            branch_parent = None
+            try:
+                branch_parent = fork.parent.get_branch(branch_fork.name)
+            except GithubException:
+                # Branch Not Found -> take master
+                branch_parent = fork.parent.get_branch(fork.parent.default_branch)
+
+            try:
+                branch_comparisons[fork.full_name][branch_fork.name] = fork.parent.compare(branch_parent.name, "{0}:{1}".format(fork.owner.login, branch_fork.name))
+            except GithubException as e:
+                # will get triggered when:
+                # fork clone, newbranch and pullrequest
+                # parent receives forced update and no common ancestor is there
+                print("While comparing '{0}' with '{1}:{2}': {3} (status: {4}) ".format(branch_parent.name, fork.full_name, branch_fork.name, e.data['message'], e.status))
+
+    # check for open issues
+    issue_comparison = defaultdict(dict)
+    if args.issues:
+        for fork in forks:
+            issue_comparison[fork.full_name] = fork.has_issues and fork.open_issues_count > 0
+
+    # Check for forked repos
+    forks_comparison = defaultdict(dict)
+    if args.forks:
+        for fork in forks:
+            forks_comparison[fork.full_name] = fork.forks_count > 0
+
+
+    print("END: Retrieving information")
+
+    for fork in forks:
+        reasons_old = []
+        reasons_new = []
+
+        if args.verbose > 1:
+            print("Fork: {0}".format(fork.full_name))
+
+        for branch in branch_comparisons[fork.full_name]:
+            comp = branch_comparisons[fork.full_name][branch]
+            diff = comp.ahead_by
+            if comp.ahead_by > 0:
+                res = "Branch newer '{0}' than its branch from parent".format(branch)
+                reasons_new.append(res)
+                if args.verbose > 1:
+                    print(res)
+            else:
+                res = "Branch older '{0}' than its branch from parent".format(branch)
+                reasons_old.append(res)
+                if args.verbose > 1:
+                    print(res)
+
+        if args.issues and issue_comparison[fork.full_name]:
+            res = "Fork '{0}' has got opened issues.".format(fork.full_name)
+            reasons_new.append(res)
+            if args.verbose > 1:
+                print(res)
+
+        if args.forks and forks_comparison[fork.full_name]:
+            res = "Fork '{0}' is parent of other forks.".format(fork.full_name)
+            reasons_new.append(res)
+            if args.verbose > 1:
+                print(res)
+
+        if len(reasons_new) > 0:
+            if args.verbose > 0 and not args.dry:
+                print("You should not remove repo '{0}'".format(fork.full_name))
+                for res in reasons_new:
+                    print(res)
+            if args.dry:
+                print("DRYRUN: I would not touch repo '{0}' now.".format(fork.full_name))
+                for res in reasons_new:
+                    print(res)
+        else:
+            if args.verbose > 0 and not args.dry:
+                print("You can safely remove repo '{0}'".format(fork.full_name))
+                for res in reasons_old:
+                    print(res)
+            if args.dry:
+                print("DRYRUN: I would remove repo '{0}' now.".format(fork.full_name))
+                for res in reasons_old:
+                    print(res)
+            else:
+                for res in reasons_old:
+                    print(res)
+                if args.yes or input("Do you want to delete fork '{0}'? (y/n) ".format(fork.full_name)) == "y":
+                    print("Deleting fork '{0}'.".format(fork.full_name))
+                    try:
+                        fork.delete()
+                    except GithubException as e:
+                        print("We're not allowed to remove the fork '{0}': '{1}'. Did you give the correct credentials?".format(fork.full_name, e.data['message']))
+                        sys.exit(1)
+        print()
+
+except BadCredentialsException as e:
+    print("We're not allowed to use the Github Service: '{0}'. Did you give the correct credentials?".format(e.data['message']))
+    sys.exit(1)
+except TwoFactorException as e:
+    print("There are problems occuring with the Two-Factor-Auth: {0}.".format(e.data['message']))
+    sys.exit(1)
+except RateLimitExceededException as e:
+    # Actually never tested. 5000 Calls in an hour. This is too much to really test it.
+    print("Shit, we've hit the maximum Limit. Something really bad happened here! Message from GH: {0}".format(e.data['message']))
+    sys.exit(1)
+except GithubException as e:
+    print("An exception occured: '{0}' (status {1}).".format(e.data['message'], e.status))
+    sys.exit(1)
+except SystemExit as e:
+    sys.exit(e.code)
+
+print("You have '{0}' API queries left.".format(gh.get_rate_limit().rate.remaining))
+sys.exit(0)
